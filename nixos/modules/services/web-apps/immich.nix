@@ -7,12 +7,20 @@
 }:
 let
   cfg = config.services.immich;
+  rknnEnabled = cfg.machine-learning.enable && cfg.machine-learning.acceleration == "rknn";
   format = pkgs.formats.json { };
   isPostgresUnixSocket = lib.hasPrefix "/" cfg.database.host;
   isRedisUnixSocket = lib.hasPrefix "/" cfg.redis.host;
   secretsReplacement = utils.genJqSecretsReplacement {
     loadCredential = true;
   } cfg.settings "/run/immich/config.json";
+  machineLearningPackage =
+    # Let the module assertion report unsupported platforms before evaluating
+    # the architecture-restricted RKNN package.
+    if rknnEnabled && pkgs.stdenv.hostPlatform.system == "aarch64-linux" then
+      cfg.package.machine-learning.override { rknnSupport = true; }
+    else
+      cfg.package.machine-learning;
 
   commonServiceConfig = {
     Type = "simple";
@@ -213,6 +221,25 @@ in
           Extra configuration environment variables. Refer to the [documentation](https://immich.app/docs/install/environment-variables) for options tagged with 'machine-learning'.
         '';
       };
+      acceleration = mkOption {
+        type = types.nullOr (types.enum [ "rknn" ]);
+        default = null;
+        example = "rknn";
+        description = ''
+          Hardware acceleration backend for Immich machine learning.
+
+          RKNN is supported on AArch64 Linux systems with Rockchip RK3566, RK3568, RK3576, or RK3588 SoCs
+          and RKNPU driver v0.9.8 or later. It uses the proprietary Rockchip runtime and Toolkit Lite packages;
+          enable unfree packages in your Nixpkgs configuration to use it.
+
+          Set {option}`services.immich.accelerationDevices` to the NPU device node or `null` to allow all devices.
+          The machine-learning service receives supplementary `video` and `render` groups for device access.
+
+          For RK3576 and RK3588, setting `MACHINE_LEARNING_RKNN_THREADS` to `"2"` or `"3"` in
+          {option}`services.immich.machine-learning.environment` can improve performance at the cost of
+          one model copy per thread in memory. The upstream default is one thread.
+        '';
+      };
     };
 
     accelerationDevices = mkOption {
@@ -220,9 +247,13 @@ in
       default = [ ];
       example = [ "/dev/dri/renderD128" ];
       description = ''
-        A list of device paths to hardware acceleration devices that immich should
-        have access to. This is useful when transcoding media files.
+        A list of device paths to hardware acceleration devices that Immich should
+        have access to. This is useful when transcoding media files or using machine-learning acceleration.
         The special value `[ ]` will disallow all devices using `PrivateDevices`. `null` will give access to all devices.
+
+        For Rockchip NPU acceleration, set this to the NPU device node available on your system, commonly `/dev/dri/renderD128` or `/dev/rknpu` on older BSP kernels.
+        RKNN machine learning automatically receives the supplementary `video` and `render` groups.
+        For other device groups or hardware-accelerated transcoding, ensure the Immich service user belongs to the groups that own the device.
       '';
     };
 
@@ -303,6 +334,14 @@ in
       {
         assertion = !isPostgresUnixSocket -> cfg.secretsFile != null;
         message = "A secrets file containing at least the database password must be provided when unix sockets are not used.";
+      }
+      {
+        assertion = !rknnEnabled || cfg.accelerationDevices != [ ];
+        message = "`services.immich.accelerationDevices` must allow the NPU device when `services.immich.machine-learning.acceleration` is `\"rknn\"`.";
+      }
+      {
+        assertion = !rknnEnabled || pkgs.stdenv.hostPlatform.system == "aarch64-linux";
+        message = "`services.immich.machine-learning.acceleration = \"rknn\"` requires aarch64-linux.";
       }
     ];
 
@@ -458,13 +497,27 @@ in
       requires = lib.mkIf cfg.database.enable [ "postgresql.target" ];
       after = [ "network.target" ] ++ lib.optionals cfg.database.enable [ "postgresql.target" ];
       wantedBy = [ "multi-user.target" ];
-      inherit (cfg.machine-learning) environment;
+      environment =
+        lib.optionalAttrs rknnEnabled {
+          MACHINE_LEARNING_RKNN = "True";
+        }
+        // cfg.machine-learning.environment;
       serviceConfig = commonServiceConfig // {
-        ExecStart = lib.getExe cfg.package.machine-learning;
+        ExecStart = lib.getExe machineLearningPackage;
         Slice = "system-immich.slice";
         CacheDirectory = "immich";
         User = cfg.user;
         Group = cfg.group;
+        SupplementaryGroups = lib.optionals rknnEnabled [
+          "video"
+          "render"
+        ];
+        BindReadOnlyPaths = lib.optionals rknnEnabled [
+          # RKNN Toolkit Lite2 loads the runtime from this absolute path.
+          "${pkgs.librknnrt}/lib/librknnrt.so:/usr/lib/librknnrt.so"
+          # /proc/device-tree is a symlink to this path on supported boards.
+          "-/sys/firmware/devicetree/base"
+        ];
       };
     };
 
