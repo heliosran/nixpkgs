@@ -2,14 +2,23 @@
   lib,
   immich,
   python3,
+  python312,
+  rknnSupport ? false,
   nixosTests,
   stdenv,
 }:
 let
-  python = python3.override {
+  pythonBase = if rknnSupport then python312 else python3;
+  python = pythonBase.override {
     self = python;
   };
 in
+assert lib.assertMsg (
+  !rknnSupport || stdenv.hostPlatform.system == "aarch64-linux"
+) "immich-machine-learning: RKNN support requires aarch64-linux";
+assert lib.assertMsg (
+  !rknnSupport || lib.versions.majorMinor pythonBase.version == "3.12"
+) "immich-machine-learning: RKNN support requires Python 3.12";
 python.pkgs.buildPythonApplication rec {
   pname = "immich-machine-learning";
   inherit (immich) version;
@@ -46,6 +55,7 @@ python.pkgs.buildPythonApplication rec {
       uvicorn
       rapidocr
     ]
+    ++ lib.optionals rknnSupport [ rknn-toolkit-lite2 ]
     ++ uvicorn.optional-dependencies.standard;
 
   # aarch64-linux tries to get cpu information from /sys, which isn't available
@@ -81,6 +91,7 @@ python.pkgs.buildPythonApplication rec {
 
   passthru.tests = {
     inherit (nixosTests) immich;
+    rknn-module = nixosTests.immich-rknn-eval;
   };
 
   meta = {
